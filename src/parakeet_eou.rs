@@ -14,7 +14,6 @@ const HOP_LENGTH: usize = 160;
 const N_MELS: usize = 128;
 const PREEMPH: f32 = 0.97;
 const LOG_ZERO_GUARD: f32 = 5.960_464_5e-8;
-const FMAX: f32 = 8000.0;
 
 /// Shared handle to a loaded ParakeetEOU model.
 /// The ONNX session is loaded once and reference-counted.
@@ -76,7 +75,7 @@ impl ParakeetEOUHandle {
 
         let exec_config = config.unwrap_or_default();
         let model = ParakeetEOUModel::from_pretrained(path, exec_config)?;
-        let mel_basis = create_mel_filterbank_htk();
+        let mel_basis = mel_filterbank();
 
         Ok(Self {
             model: Arc::new(Mutex::new(model)),
@@ -286,54 +285,97 @@ fn apply_blank_penalty(mut vocab: ndarray::ArrayViewMut1<f32>, penalty: f32) {
     }
 }
 
-/// HTK mel filterbank used by Parakeet EOU. its distinct from the Slaney-scaled
-/// filterbank in [`crate::audio::create_mel_filterbank`] so please don't confuse :-).
-fn create_mel_filterbank_htk() -> Array2<f32> {
-    let num_freqs = N_FFT / 2 + 1;
-
-    let hz_to_mel = |hz: f32| 2595.0 * (1.0 + hz / 700.0).log10();
-    let mel_to_hz = |mel: f32| 700.0 * (10.0_f32.powf(mel / 2595.0) - 1.0);
-
-    let mel_min = hz_to_mel(0.0);
-    let mel_max = hz_to_mel(FMAX);
-
-    let mel_points: Vec<f32> = (0..=N_MELS + 1)
-        .map(|i| mel_to_hz(mel_min + (mel_max - mel_min) * i as f32 / (N_MELS + 1) as f32))
-        .collect();
-
-    let fft_freqs: Vec<f32> = (0..num_freqs)
-        .map(|i| (SAMPLE_RATE as f32 / N_FFT as f32) * i as f32)
-        .collect();
-
-    let mut weights = Array2::zeros((N_MELS, num_freqs));
-
-    for i in 0..N_MELS {
-        let left = mel_points[i];
-        let center = mel_points[i + 1];
-        let right = mel_points[i + 2];
-        for (j, &freq) in fft_freqs.iter().enumerate() {
-            if freq >= left && freq <= center {
-                weights[[i, j]] = (freq - left) / (center - left);
-            } else if freq > center && freq <= right {
-                weights[[i, j]] = (right - freq) / (right - center);
-            }
-        }
-    }
-
-    for i in 0..N_MELS {
-        let enorm = 2.0 / (mel_points[i + 2] - mel_points[i]);
-        for j in 0..num_freqs {
-            weights[[i, j]] *= enorm;
-        }
-    }
-
-    weights
+/// The mel filterbank NeMo builds for the Parakeet EOU model, which the
+/// encoder was trained on: `AudioToMelSpectrogramPreprocessor` with the
+/// model's preprocessor config (128 features, n_fft 512, 16 kHz, nothing else
+/// about the filterbank overridden), i.e.
+/// `librosa.filters.mel(sr=16000, n_fft=512, n_mels=128, norm="slaney")` on
+/// librosa's default Slaney mel scale. That is
+/// [`crate::audio::create_mel_filterbank`]; an HTK-scale filterbank is a
+/// different set of bands (see the test below).
+fn mel_filterbank() -> Array2<f32> {
+    crate::audio::create_mel_filterbank(N_FFT, N_MELS, SAMPLE_RATE)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use ndarray::aview_mut1;
+
+    // NeMo's mel filterbank for this model at a spread of (band, FFT bin)
+    // cells: each band's peak and its nonzero neighbours. From
+    // `FilterbankFeatures.fb` of NeMo 2.6.0 (the version in the model's
+    // config) built from the model's preprocessor config, which is exactly
+    // `librosa.filters.mel(sr=16000, n_fft=512, n_mels=128, norm="slaney")`
+    // (librosa 0.11.0).
+    const NEMO_FILTERBANK: &[(usize, usize, f32)] = &[
+        (0, 1, 2.83775423e-02),
+        (1, 1, 1.43890083e-02),
+        (1, 2, 1.39885349e-02),
+        (10, 8, 2.95789633e-02),
+        (20, 15, 2.00236728e-03),
+        (20, 16, 2.63751745e-02),
+        (40, 30, 4.00473457e-03),
+        (40, 31, 2.43728068e-02),
+        (64, 54, 1.12167057e-02),
+        (64, 55, 1.88182835e-02),
+        (64, 56, 6.49144524e-04),
+        (90, 101, 5.54661918e-03),
+        (90, 102, 1.08582862e-02),
+        (90, 103, 9.82366409e-03),
+        (100, 129, 5.85763063e-03),
+        (100, 130, 9.13691055e-03),
+        (100, 131, 8.00091028e-03),
+        (127, 249, 4.50653443e-03),
+        (127, 250, 5.22318855e-03),
+        (127, 251, 4.35265712e-03),
+    ];
+    // The FFT bin each of those bands peaks at in NeMo's filterbank.
+    const NEMO_PEAK_BINS: &[(usize, usize)] = &[
+        (0, 1),
+        (10, 8),
+        (20, 16),
+        (40, 31),
+        (64, 55),
+        (90, 102),
+        (100, 130),
+        (127, 250),
+    ];
+    // The sum of all 128 x 257 weights of NeMo's filterbank.
+    const NEMO_FILTERBANK_SUM: f64 = 4.090487653877062;
+
+    // The model must be fed the mel bands it was trained on: NeMo's, on the
+    // Slaney mel scale. An HTK-scale filterbank is a different set of bands
+    // (123 of the 128 peak at a different FFT bin; band 100 at 4344 Hz where
+    // NeMo's peaks at 4063 Hz), and most of the cells above are zero in it.
+    #[test]
+    fn mel_filterbank_is_the_one_nemo_builds_for_this_model() {
+        let fb = mel_filterbank();
+        assert_eq!(fb.dim(), (N_MELS, N_FFT / 2 + 1));
+
+        for &(band, bin, want) in NEMO_FILTERBANK {
+            let got = fb[[band, bin]];
+            assert!(
+                (got - want).abs() < 1e-7,
+                "band {band}, bin {bin}: weight {got:e}, NeMo's is {want:e}"
+            );
+        }
+
+        for &(band, want) in NEMO_PEAK_BINS {
+            let (got, _) = crate::tensor_utils::argmax_f32(fb.row(band).iter().copied());
+            assert_eq!(
+                got, want,
+                "band {band} peaks at bin {got}, NeMo's at {want}"
+            );
+        }
+
+        // The whole matrix, not only the sampled cells.
+        let sum: f64 = fb.iter().map(|&w| f64::from(w)).sum();
+        assert!(
+            (sum - NEMO_FILTERBANK_SUM).abs() < 1e-5,
+            "weights sum to {sum}, NeMo's to {NEMO_FILTERBANK_SUM}"
+        );
+    }
 
     // Joint output: 1026 tokenizer tokens (ids 0..=1025) + blank at 1026.
     const LOGIT_WIDTH: usize = 1027;
