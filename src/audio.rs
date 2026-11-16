@@ -333,4 +333,21 @@ mod tests {
         assert_eq!(spec.shape()[0], freq_bins);
         assert_eq!(spec.shape()[1], audio.len() / hop_length);
     }
+
+    #[test]
+    fn mel_filterbank_matches_librosa_slaney() {
+        // peaks of librosa.filters.mel(sr=16000, n_fft=512, n_mels=128, norm="slaney")
+        let fb = create_mel_filterbank(512, 128, 16000);
+        for (band, bin, want) in [
+            (0, 1, 2.8377542e-2),
+            (40, 31, 2.4372807e-2),
+            (100, 130, 9.136911e-3),
+            (127, 250, 5.2231885e-3),
+        ] {
+            assert!(
+                (fb[[band, bin]] - want).abs() < 1e-7,
+                "band {band}, bin {bin}"
+            );
+        }
+    }
 }

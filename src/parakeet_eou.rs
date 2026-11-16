@@ -14,7 +14,6 @@ const HOP_LENGTH: usize = 160;
 const N_MELS: usize = 128;
 const PREEMPH: f32 = 0.97;
 const LOG_ZERO_GUARD: f32 = 5.960_464_5e-8;
-const FMAX: f32 = 8000.0;
 
 /// Shared handle to a loaded ParakeetEOU model.
 /// The ONNX session is loaded once and reference-counted.
@@ -76,7 +75,7 @@ impl ParakeetEOUHandle {
 
         let exec_config = config.unwrap_or_default();
         let model = ParakeetEOUModel::from_pretrained(path, exec_config)?;
-        let mel_basis = create_mel_filterbank_htk();
+        let mel_basis = crate::audio::create_mel_filterbank(N_FFT, N_MELS, SAMPLE_RATE);
 
         Ok(Self {
             model: Arc::new(Mutex::new(model)),
@@ -284,50 +283,6 @@ fn apply_blank_penalty(mut vocab: ndarray::ArrayViewMut1<f32>, penalty: f32) {
     if let Some(blank_logit) = vocab.last_mut() {
         *blank_logit -= penalty;
     }
-}
-
-/// HTK mel filterbank used by Parakeet EOU. its distinct from the Slaney-scaled
-/// filterbank in [`crate::audio::create_mel_filterbank`] so please don't confuse :-).
-fn create_mel_filterbank_htk() -> Array2<f32> {
-    let num_freqs = N_FFT / 2 + 1;
-
-    let hz_to_mel = |hz: f32| 2595.0 * (1.0 + hz / 700.0).log10();
-    let mel_to_hz = |mel: f32| 700.0 * (10.0_f32.powf(mel / 2595.0) - 1.0);
-
-    let mel_min = hz_to_mel(0.0);
-    let mel_max = hz_to_mel(FMAX);
-
-    let mel_points: Vec<f32> = (0..=N_MELS + 1)
-        .map(|i| mel_to_hz(mel_min + (mel_max - mel_min) * i as f32 / (N_MELS + 1) as f32))
-        .collect();
-
-    let fft_freqs: Vec<f32> = (0..num_freqs)
-        .map(|i| (SAMPLE_RATE as f32 / N_FFT as f32) * i as f32)
-        .collect();
-
-    let mut weights = Array2::zeros((N_MELS, num_freqs));
-
-    for i in 0..N_MELS {
-        let left = mel_points[i];
-        let center = mel_points[i + 1];
-        let right = mel_points[i + 2];
-        for (j, &freq) in fft_freqs.iter().enumerate() {
-            if freq >= left && freq <= center {
-                weights[[i, j]] = (freq - left) / (center - left);
-            } else if freq > center && freq <= right {
-                weights[[i, j]] = (right - freq) / (right - center);
-            }
-        }
-    }
-
-    for i in 0..N_MELS {
-        let enorm = 2.0 / (mel_points[i + 2] - mel_points[i]);
-        for j in 0..num_freqs {
-            weights[[i, j]] *= enorm;
-        }
-    }
-
-    weights
 }
 
 #[cfg(test)]
