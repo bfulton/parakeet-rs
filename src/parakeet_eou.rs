@@ -151,6 +151,41 @@ impl ParakeetEOU {
     /// - Slices last (pre_encode_cache + new_frames) for encoder input
     /// - pre_encode_cache=9 frames, new_frames=~16, total=~25 frames to encoder
     pub fn transcribe(&mut self, chunk: &[f32], reset_on_eou: bool) -> Result<String> {
+        let (text, eou) = self.decode_chunk(chunk, reset_on_eou)?;
+        Ok(if eou && reset_on_eou {
+            text + " [EOU]"
+        } else {
+            text
+        })
+    }
+
+    /// Transcribe a chunk of audio samples and report whether the model
+    /// predicted end-of-utterance in it, leaving the decoder as it is.
+    ///
+    /// Returns the text decoded from this chunk and the EOU flag. This is
+    /// `transcribe(chunk, false)` that also says when the EOU came, for a
+    /// caller that decides for itself where an utterance ends.
+    ///
+    /// `transcribe(chunk, true)` reports the EOU too, but resets the decoder
+    /// state on the spot. That is right when the EOU is the end of the
+    /// utterance. It is not always: the model predicts EOU mid-word on a lone
+    /// word, and a frame or two into any stretch of digital silence, a pause
+    /// in the middle of a sentence included. A caller that keeps the utterance
+    /// open there gets the rest of it decoded by a decoder that has forgotten
+    /// the words so far, and the model then transcribes those words a second
+    /// time ("what is the", pause, "what is the capital of france") or drops
+    /// what follows. With this method the state is kept, the words after the
+    /// pause continue the ones before it, and the flag stays set on each chunk
+    /// for as long as the model goes on predicting EOU. To start a new
+    /// utterance, make a new decoder with [`ParakeetEOU::from_shared`].
+    pub fn transcribe_with_eou(&mut self, chunk: &[f32]) -> Result<(String, bool)> {
+        self.decode_chunk(chunk, false)
+    }
+
+    /// Decode one chunk: the text it produced and whether the model predicted
+    /// EOU in it. With `reset_on_eou` the decoder state is reset at the EOU and
+    /// the rest of the chunk is not decoded.
+    fn decode_chunk(&mut self, chunk: &[f32], reset_on_eou: bool) -> Result<(String, bool)> {
         // Add new chunk to rolling buffer
         self.audio_buffer.extend(chunk.iter().copied());
 
@@ -162,7 +197,7 @@ impl ParakeetEOU {
         // Wait until buffer has minimum samples (at least 1 second for stable features)
         const MIN_BUFFER_SAMPLES: usize = SAMPLE_RATE; // 1 second
         if self.audio_buffer.len() < MIN_BUFFER_SAMPLES {
-            return Ok(String::new());
+            return Ok((String::new(), false));
         }
 
         // Extract features from FULL buffer (provides context for feature extraction)
@@ -193,13 +228,14 @@ impl ParakeetEOU {
 
         let total_frames = encoder_out.shape()[2];
         if total_frames == 0 {
-            return Ok(String::new());
+            return Ok((String::new(), false));
         }
 
         // Process all output frames (typically 1 frame per chunk)
         let new_frames = encoder_out;
 
         let mut text_output = String::new();
+        let mut eou = false;
 
         // Hold the lock once across the decoder loop to avoid per-step acquire/release.
         let mut model = self
@@ -230,10 +266,11 @@ impl ParakeetEOU {
                 }
 
                 if max_idx == self.eou_id {
+                    eou = true;
                     if reset_on_eou {
                         drop(model);
                         self.reset_states();
-                        return Ok(text_output + " [EOU]");
+                        return Ok((text_output, true));
                     }
                     break;
                 }
@@ -252,7 +289,7 @@ impl ParakeetEOU {
                 syms_added += 1;
             }
         }
-        Ok(text_output)
+        Ok((text_output, eou))
     }
 
     fn reset_states(&mut self) {
