@@ -35,6 +35,13 @@ pub struct ParakeetEOUHandle {
 /// For a single stream use [`ParakeetEOU::from_pretrained`]. For multiple
 /// concurrent streams sharing one loaded model, use
 /// [`ParakeetEOUHandle::from_pretrained`] followed by [`ParakeetEOU::from_shared`].
+///
+/// A clone is the stream as it stands at that moment: its own copy of the
+/// audio context, the encoder cache and the decoder state, on the same loaded
+/// model. The two then go their own ways, so a caller can find out what a
+/// continuation would decode to (say, silence from here on) without putting
+/// the stream itself through it, and keep whichever of the two it wants.
+#[derive(Clone)]
 pub struct ParakeetEOU {
     model: Arc<Mutex<ParakeetEOUModel>>,
     tokenizer: Arc<tokenizers::Tokenizer>,
@@ -338,6 +345,15 @@ fn mel_filterbank() -> Array2<f32> {
 mod tests {
     use super::*;
     use ndarray::aview_mut1;
+
+    // A stream's state can be copied: callers rely on it to try a
+    // continuation on a copy (see the type's docs).
+    #[test]
+    fn a_stream_is_clone() {
+        fn assert_clone<T: Clone>() {}
+        assert_clone::<ParakeetEOU>();
+        assert_clone::<EncoderCache>();
+    }
 
     // NeMo's mel filterbank for this model at a spread of (band, FFT bin)
     // cells: each band's peak and its nonzero neighbours. From
